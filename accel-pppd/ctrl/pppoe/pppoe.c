@@ -33,12 +33,20 @@
 #include "pppoe.h"
 
 #include "memdebug.h"
+#include "ppp_lcp.h"
+#include "ppp_auth.h"
 
 #define SID_MAX 65536
 
 #ifndef min
 #define min(x,y) ((x)<(y)?(x):(y))
 #endif
+
+extern int conf_ppp_5g_registration;
+extern int conf_noauth; 
+struct triton_context_t resume_ctx;
+extern void __export auth_layer_resume (struct ppp_t *ppp);
+int register_5g = 0;
 
 struct pppoe_conn_t {
 	struct list_head entry;
@@ -70,6 +78,7 @@ struct delayed_pado_t
 	struct pppoe_tag *host_uniq;
 	struct pppoe_tag *relay_sid;
 	struct pppoe_tag *service_name;
+	struct pppoe_tag *vendor_tag;
 	uint16_t ppp_max_payload;
 };
 
@@ -174,6 +183,11 @@ static void disconnect(struct pppoe_conn_t *conn)
 
 	pppoe_send_PADT(conn);
 
+        if (conf_ppp_5g_registration)
+	{
+	    triton_event_fire (EV_5G_DEREGISTRATION, &conn->ppp.ses);
+	}
+
 	triton_event_fire(EV_CTRL_FINISHED, &conn->ppp.ses);
 
 	log_ppp_info1("disconnected\n");
@@ -269,8 +283,8 @@ static void pppoe_conn_ctx_switch(struct triton_context_t *ctx, void *arg)
 	net = conn->ppp.ses.net;
 	log_switch(ctx, &conn->ppp.ses);
 }
+static struct pppoe_conn_t *allocate_channel(struct pppoe_serv_t *serv, const uint8_t *addr, const struct pppoe_tag *host_uniq, const struct pppoe_tag *relay_sid, const struct pppoe_tag *service_name,const struct pppoe_tag *circuit_id, const struct pppoe_tag *remote_id, const struct pppoe_tag *tr101, const uint8_t *cookie, uint16_t ppp_max_payload)
 
-static struct pppoe_conn_t *allocate_channel(struct pppoe_serv_t *serv, const uint8_t *addr, const struct pppoe_tag *host_uniq, const struct pppoe_tag *relay_sid, const struct pppoe_tag *service_name, const struct pppoe_tag *tr101, const uint8_t *cookie, uint16_t ppp_max_payload)
 {
 	struct pppoe_conn_t *conn;
 	unsigned long *old_sid_ptr;
@@ -405,7 +419,11 @@ static struct pppoe_conn_t *allocate_channel(struct pppoe_serv_t *serv, const ui
 	conn->ppp.ses.net = serv->net;
 	conn->ppp.ses.ctrl = &conn->ctrl;
 	conn->ppp.ses.chan_name = conn->ctrl.calling_station_id;
-     conn->ppp.ses.conn_pppoe_sid = conn->sid;
+	conn->ppp.ses.conn_pppoe_sid = conn->sid;
+	if (circuit_id)
+	        memcpy (conn->ppp.ses.circuit_id, circuit_id->tag_data, circuit_id->tag_len);
+	if (remote_id)
+	        memcpy (conn->ppp.ses.remote_id, remote_id->tag_data, remote_id->tag_len);
 
 	if (conf_ip_pool)
 		conn->ppp.ses.ipv4_pool_name = _strdup(conf_ip_pool);
@@ -416,6 +434,7 @@ static struct pppoe_conn_t *allocate_channel(struct pppoe_serv_t *serv, const ui
 
 	pthread_mutex_lock(&serv->lock);
 	list_add_tail(&conn->entry, &serv->conn_list);
+
 	if (serv->timer.tpd)
 		triton_timer_del(&serv->timer);
 	serv->conn_cnt++;
@@ -489,6 +508,18 @@ static struct pppoe_conn_t *find_channel(struct pppoe_serv_t *serv, const uint8_
 
 	return NULL;
 }
+struct pppoe_conn_t * __export find_channel_from_session(struct pppoe_serv_t *serv, const int session_id)
+{
+        struct pppoe_conn_t *conn;
+
+        list_for_each_entry(conn, &serv->conn_list, entry) {
+                if (session_id == conn->ppp.ses.conn_pppoe_sid)
+                        return conn;
+        }
+
+        return NULL;
+}
+
 
 static void print_tag_string(struct pppoe_tag *tag)
 {
@@ -516,7 +547,10 @@ static void print_packet(const char *ifname, const char *op, uint8_t *pack)
 	struct ethhdr *ethhdr = (struct ethhdr *)pack;
 	struct pppoe_hdr *hdr = (struct pppoe_hdr *)(pack + ETH_HLEN);
 	struct pppoe_tag *tag;
-	int n;
+
+	int n, i;
+	unsigned int tmp_val =0;
+	unsigned int offset =0;
 
 	log_info2("%s: %s [PPPoE ", ifname, op);
 
@@ -586,8 +620,42 @@ static void print_packet(const char *ifname, const char *op, uint8_t *pack)
 					log_info2(" <Vendor-Specific invalid>");
 				else
 					log_info2(" <Vendor-Specific %x>", ntohl(*(uint32_t *)tag->tag_data));
+				log_info2 (">");
+				offset += 4;
+				tmp_val = 0;
+				memcpy (&(tmp_val), &(tag->tag_data[offset]), 1);
+				if (tmp_val)
+				{
+					offset += 1;
+					tmp_val = 0;
+					memcpy (&tmp_val, &(tag->tag_data[offset]), 1);
+					offset+=1;
+					log_info2(" <Circuit_id ");
+					for (i=0; i< tmp_val; i++)
+					{
+						log_info2 ("%c", tag->tag_data[offset]);
+						offset ++;
+					}
+					log_info2 (">");
+					tmp_val= tag->tag_data[offset] ;
+				}
+				if (tmp_val == 2)
+				{
+					offset += 1;
+					tmp_val =0;
+					memcpy (&tmp_val, &(tag->tag_data[offset]), 1);
+					log_info2(" <Remote_id ");
+					for (i =0; i < tmp_val; i++)
+					{
+						log_info2 ("%c",  tag->tag_data [offset]);
+						offset ++;
+					}
+					log_info2 (">");
+					tmp_val= tag->tag_data[offset] ;
+				}
+
 				break;
-			case TAG_RELAY_SESSION_ID:
+		case TAG_RELAY_SESSION_ID:
 				log_info2(" <Relay-Session-Id ");
 				print_tag_octets(tag);
 				log_info2(">");
@@ -757,7 +825,7 @@ static void pppoe_send(struct pppoe_serv_t *serv, const uint8_t *pack)
 	net->sendto(serv->disc_sock, pack, len, MSG_DONTWAIT, (struct sockaddr *)&addr, sizeof(addr));
 }
 
-static void pppoe_send_PADO(struct pppoe_serv_t *serv, const uint8_t *addr, const struct pppoe_tag *host_uniq, const struct pppoe_tag *relay_sid, const struct pppoe_tag *service_name, uint16_t ppp_max_payload)
+static void pppoe_send_PADO(struct pppoe_serv_t *serv, const uint8_t *addr, const struct pppoe_tag *host_uniq, const struct pppoe_tag *relay_sid, const struct pppoe_tag *service_name, uint16_t ppp_max_payload, const struct pppoe_tag *vendor_tag)
 {
 	uint8_t pack[ETHER_MAX_LEN];
 	uint8_t cookie[COOKIE_LENGTH];
@@ -791,10 +859,14 @@ static void pppoe_send_PADO(struct pppoe_serv_t *serv, const uint8_t *addr, cons
 		add_tag(pack, TAG_PPP_MAX_PAYLOAD, &ppp_max_payload, 2);
 	}
 
+	if (vendor_tag)
+		add_tag(pack, TAG_VENDOR_SPECIFIC, vendor_tag->tag_data, ntohs(vendor_tag->tag_len));
+
 	if (conf_verbose)
 		print_packet(serv->ifname, "send", pack);
 
 	__sync_add_and_fetch(&stat_PADO_sent, 1);
+
 	pppoe_send(serv, pack);
 }
 
@@ -888,7 +960,7 @@ static void pado_timer(struct triton_timer_t *t)
 	struct delayed_pado_t *pado = container_of(t, typeof(*pado), timer);
 
 	if (!ap_shutdown)
-		pppoe_send_PADO(pado->serv, pado->addr, pado->host_uniq, pado->relay_sid, pado->service_name, pado->ppp_max_payload);
+		pppoe_send_PADO(pado->serv, pado->addr, pado->host_uniq, pado->relay_sid,pado->service_name, pado->ppp_max_payload, pado->vendor_tag);
 
 	free_delayed_pado(pado);
 }
@@ -951,6 +1023,7 @@ static void pppoe_recv_PADI(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 	struct pppoe_tag *host_uniq_tag = NULL;
 	struct pppoe_tag *relay_sid_tag = NULL;
 	struct pppoe_tag *service_name_tag = NULL;
+	struct pppoe_tag *vendor_tag = NULL;
 	int len, n, service_match = conf_service_name[0] == NULL;
 	struct delayed_pado_t *pado;
 	struct timespec ts;
@@ -1007,6 +1080,10 @@ static void pppoe_recv_PADI(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 			case TAG_RELAY_SESSION_ID:
 				relay_sid_tag = tag;
 				break;
+			case TAG_VENDOR_SPECIFIC:
+				vendor_tag = tag;
+				break;
+
 			case TAG_PPP_MAX_PAYLOAD:
 				if (ntohs(tag->tag_len) == 2)
 					ppp_max_payload = ntohs(*(uint16_t *)tag->tag_data);
@@ -1054,6 +1131,12 @@ static void pppoe_recv_PADI(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 			memcpy(pado->service_name, service_name_tag, sizeof(*service_name_tag) + ntohs(service_name_tag->tag_len));
 		}
 
+		if (vendor_tag) {
+			pado->vendor_tag = _malloc(sizeof(*vendor_tag) + ntohs(vendor_tag->tag_len));
+			memcpy(pado->vendor_tag, vendor_tag, sizeof(*vendor_tag) + ntohs(vendor_tag->tag_len));
+
+		}
+
 		pado->ppp_max_payload = ppp_max_payload;
 
 		pado->timer.expire = pado_timer;
@@ -1065,7 +1148,8 @@ static void pppoe_recv_PADI(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 		list_add_tail(&pado->entry, &serv->pado_list);
 		__sync_add_and_fetch(&stat_delayed_pado, 1);
 	} else
-		pppoe_send_PADO(serv, ethhdr->h_source, host_uniq_tag, relay_sid_tag, service_name_tag, ppp_max_payload);
+		pppoe_send_PADO(serv, ethhdr->h_source, host_uniq_tag, relay_sid_tag, service_name_tag, ppp_max_payload, vendor_tag);
+
 }
 
 static void pppoe_recv_PADR(struct pppoe_serv_t *serv, uint8_t *pack, int size)
@@ -1078,10 +1162,14 @@ static void pppoe_recv_PADR(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 	struct pppoe_tag *ac_cookie_tag = NULL;
 	struct pppoe_tag *service_name_tag = NULL;
 	struct pppoe_tag *tr101_tag = NULL;
-	int n, service_match = 0;
+	struct pppoe_tag *remote_id_tag = NULL;
+	struct pppoe_tag *circuit_id_tag = NULL;
+	int n,i, service_match = 0, len = 0;
 	struct pppoe_conn_t *conn;
 	int vendor_id;
 	uint16_t ppp_max_payload = 0;
+	unsigned int tmp_val = 0;
+	unsigned int offset = 0;
 
 	__sync_add_and_fetch(&stat_PADR_recv, 1);
 
@@ -1156,6 +1244,60 @@ static void pppoe_recv_PADR(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 				if (vendor_id == VENDOR_ADSL_FORUM)
 					if (conf_tr101)
 						tr101_tag = tag;
+				memcpy (&tmp_val, &(tag->tag_data[offset]), 4);
+				offset += 4;
+				tmp_val = 0;
+				memcpy (&(tmp_val), &(tag->tag_data[offset]), 1);
+				if (tmp_val)
+				{
+					len = ntohs(tag->tag_data[offset+2]);
+					circuit_id_tag = (struct pppoe_tag*)malloc (sizeof (struct pppoe_tag) + len);
+					if (circuit_id_tag == NULL)
+					{
+						log_msg ("\r\n Memory Allocation failed for circuit_id_tag");
+						break;
+					}
+					circuit_id_tag->tag_type = tmp_val;
+					offset += 1;
+
+					tmp_val = 0;
+					memcpy (&tmp_val, &(tag->tag_data[offset]), 1);
+					circuit_id_tag->tag_len = tmp_val;
+					offset+=1;
+
+					for (i=0; i< circuit_id_tag->tag_len; i++)
+					{
+						circuit_id_tag->tag_data[i] = tag->tag_data[offset];
+						offset ++;
+					}
+					tmp_val= tag->tag_data[offset] ;
+				}
+				if (tmp_val == 2)
+				{
+					len = ntohs(tag->tag_data[offset+2]);
+					remote_id_tag = (struct pppoe_tag*) malloc (sizeof (struct pppoe_tag) + len);
+         				if (remote_id_tag == NULL)
+					{
+						log_msg ("\r\n Memory Allocation failed for remote_id_tag");
+						break;
+					}
+		
+					remote_id_tag->tag_type = tmp_val;
+					offset += 1;
+					tmp_val =0;
+					memcpy (&tmp_val, &(tag->tag_data[offset]), 1);
+					remote_id_tag->tag_len = tmp_val;
+					offset +=1;
+					for (i =0; i < remote_id_tag->tag_len; i++)
+					{
+						remote_id_tag->tag_data [i] =  tag->tag_data [offset];
+						offset ++;
+					}
+					tmp_val= tag->tag_data[offset] ;
+				}
+				break;
+
+
 			case TAG_PPP_MAX_PAYLOAD:
 				if (ntohs(tag->tag_len) == 2)
 					ppp_max_payload = ntohs(*(uint16_t *)tag->tag_data);
@@ -1180,6 +1322,17 @@ static void pppoe_recv_PADR(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 			log_warn("pppoe: discard PADR packet (incorrect AC-Cookie)\n");
 		return;
 	}
+	if ((circuit_id_tag) && (circuit_id_tag->tag_len > CIRCUIT_ID_LENGTH))  {
+		if (conf_verbose)
+			log_warn("pppoe: discard PADR packet (incorrect cirucuit tag length) \n");
+		return;
+	}
+
+	if ((remote_id_tag) && (remote_id_tag->tag_len > REMOTE_ID_LENGTH))  {
+		if (conf_verbose)
+			log_warn("pppoe: discard PADR packet (incorrect remote tag length) \n");
+		return;
+	}
 
 	if (!service_match && !conf_accept_any_service) {
 		if (conf_verbose)
@@ -1198,8 +1351,11 @@ static void pppoe_recv_PADR(struct pppoe_serv_t *serv, uint8_t *pack, int size)
 
 	if (conn)
 		return;
+        conn = allocate_channel(serv, ethhdr->h_source, host_uniq_tag, relay_sid_tag, service_name_tag,circuit_id_tag, remote_id_tag, tr101_tag, (uint8_t *)ac_cookie_tag->tag_data, ppp_max_payload);
 
-	conn = allocate_channel(serv, ethhdr->h_source, host_uniq_tag, relay_sid_tag, service_name_tag, tr101_tag, (uint8_t *)ac_cookie_tag->tag_data, ppp_max_payload);
+	free (circuit_id_tag);
+	free (remote_id_tag);
+
 	if (!conn)
 		pppoe_send_err(serv, ethhdr->h_source, host_uniq_tag, relay_sid_tag, CODE_PADS, TAG_AC_SYSTEM_ERROR);
 	else {
@@ -1328,7 +1484,7 @@ out_err:
 	return -1;
 }
 
-static int __pppoe_add_interface_re(int index, int flags, const char *name, int iflink, int vid, struct iplink_arg *arg)
+int __pppoe_add_interface_re(int index, int flags, const char *name, int iflink, int vid, struct iplink_arg *arg)
 {
 	if (pcre_exec(arg->re, NULL, name, strlen(name), 0, 0, NULL, 0) < 0)
 		return 0;
@@ -1507,6 +1663,13 @@ static void __pppoe_server_start(const char *ifname, const char *opt, void *cli,
 	serv->padi_limit = padi_limit;
 
 	triton_context_register(&serv->ctx, serv);
+
+        if ((conf_ppp_5g_registration) && (register_5g == 0))
+	{
+		triton_event_register_handler(EV_SES_5G_STARTED, (triton_event_func)pppoe_session_resume);
+		triton_context_register(&resume_ctx, NULL);
+		register_5g = 1;
+	}
 
 	serv->disc_sock = pppoe_disc_start(serv);
 	if (serv->disc_sock < 0) {
@@ -2091,6 +2254,59 @@ static void pppoe_init(void)
 	connlimit_loaded = triton_module_loaded("connlimit");
 
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
+}
+
+void __pppoe_session_resume (struct ap_session_msg_t *msg)
+{
+	struct ppp_lcp_t *lcp;
+	struct pppoe_serv_t *serv;
+	struct pppoe_conn_t *conn;
+	struct ppp_handler_t *ppp_h;
+	struct ppp_t *ppp;
+
+	pthread_rwlock_rdlock(&serv_lock);
+	list_for_each_entry(serv, &serv_list, entry) {
+		if (!strcmp(msg->ifname, serv->ifname)) {
+			conn = find_channel_from_session (serv, msg->pppoe_sessionid);
+			if (conn) {
+				if (msg->pppoe_sessionid == conn->ppp.ses.conn_pppoe_sid) {
+					ppp = &conn->ppp;
+					list_for_each_entry(ppp_h, &ppp->chan_handlers, entry) {
+						if ((ppp_h->proto == PPP_LCP) && (conf_noauth)) {
+							lcp = container_of(ppp_h, typeof(*lcp), hnd);
+							ppp_layer_started (lcp->ppp, &lcp->ld);
+							break;
+						}
+						else if ((ppp_h->proto == PPP_PAP) || (ppp_h->proto == PPP_CHAP)) 
+						{
+							auth_layer_resume (ppp);
+							break;
+						}
+					}
+				}
+			}
+		}
+	}
+        pthread_rwlock_unlock(&serv_lock);
+}
+
+void __export pppoe_session_resume(struct ap_session_msg_t* msg)
+{
+	triton_context_call(&resume_ctx, (triton_event_func)__pppoe_session_resume, msg);
+}
+
+int __export pppoe_interface_find (char *ifname)
+{
+    	struct ifreq ifr;
+
+    	memset(&ifr, 0, sizeof(ifr));
+	strcpy(ifr.ifr_name, ifname);
+
+	if (ioctl(sock_fd, SIOCGIFINDEX, &ifr, sizeof(ifr))) {
+	    return 0;
+	}
+
+	return 1;
 }
 
 DEFINE_INIT(21, pppoe_init);

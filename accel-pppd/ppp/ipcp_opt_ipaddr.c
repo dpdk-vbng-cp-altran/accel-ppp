@@ -16,8 +16,9 @@
 #include "events.h"
 
 #include "memdebug.h"
-
+struct list_head __export conn_list;
 static int conf_check_exists;
+extern int conf_ppp_5g_registration;
 
 static struct ipcp_option_t *ipaddr_init(struct ppp_ipcp_t *ipcp);
 static void ipaddr_free(struct ppp_ipcp_t *ipcp, struct ipcp_option_t *opt);
@@ -106,12 +107,33 @@ static int ipaddr_send_conf_req(struct ppp_ipcp_t *ipcp, struct ipcp_option_t *o
 {
 	struct ipaddr_option_t *ipaddr_opt = container_of(opt, typeof(*ipaddr_opt), opt);
 	struct ipcp_opt32_t *opt32 = (struct ipcp_opt32_t *)ptr;
+	struct ap_session_msg_t *msg;
+	struct in_addr  ip_addr = {};
+	unsigned char buf_in_addr[sizeof(struct in6_addr)];
 	int r;
 
-	if (!ipcp->ppp->ses.ipv4) {
+	if ((!ipcp->ppp->ses.ipv4) && (conf_ppp_5g_registration == 0)) {
 		r = alloc_ip(ipcp->ppp);
 		if (r)
 			return r;
+	}
+	else if (conf_ppp_5g_registration)
+	{
+		list_for_each_entry(msg, &conn_list, entry) {
+			if(ipcp->ppp->ses.conn_pppoe_sid == msg->pppoe_sessionid)
+			{
+				ipcp->ppp->ses.ipv4  = (struct ipv4db_item_t *) malloc (sizeof (struct ipv4db_item_t));
+
+				memset (ipcp->ppp->ses.ipv4, 0, sizeof(struct ipv4db_item_t));
+				if (inet_pton (AF_INET, msg->ip_addr, buf_in_addr) == 1)
+				{
+					memcpy (&ip_addr, buf_in_addr, sizeof (struct in_addr));
+					memcpy (&ipcp->ppp->ses.ipv4->addr, buf_in_addr, sizeof (struct in_addr));
+					memcpy (&ipcp->ppp->ses.ipv4->peer_addr, buf_in_addr, sizeof (struct in_addr));
+					ipcp->ppp->ses.ipv4->is_5g_ipaddr = true;
+				}
+			}
+		}
 	}
 
 	opt32->hdr.id = CI_ADDR;

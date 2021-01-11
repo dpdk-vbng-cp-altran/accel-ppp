@@ -26,6 +26,9 @@
 #define EV_FORCE_INTERIM_UPDATE 105
 #define EV_RADIUS_ACCESS_ACCEPT 200
 #define EV_RADIUS_COA           201
+#define EV_SES_5G_STARTED       202
+#define EV_5G_REGISTRATION      206
+#define EV_5G_DEREGISTRATION    204
 
 struct ap_session;
 struct ppp_t;

@@ -14,8 +14,12 @@
 #include <pthread.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <stdbool.h>
 
 #include <hiredis/hiredis.h>
+#include <hiredis/async.h>
+#include <hiredis/adapters/libevent.h>
+
 #include <json.h>
 
 #include "log.h"
@@ -29,11 +33,13 @@
 #include "ipdb.h"
 
 extern char** environ;
+extern struct list_head conn_list;
 
 #define DEFAULT_NAS_ID "accel-ppp"
 #define DEFAULT_REDIS_HOST    "localhost"
 #define DEFAULT_REDIS_PORT     6379
 #define DEFAULT_REDIS_PUBCHAN "accel-ppp"
+#define DEFAULT_REDIS_SUBCHAN "accel-ppp-5g"
 
 enum ap_redis_events_t {
 	REDIS_EV_SES_STARTING         = 0x00000001,
@@ -57,6 +63,8 @@ enum ap_redis_events_t {
 	REDIS_EV_FORCE_INTERIM_UPDATE = 0x00040000,
 	REDIS_EV_RADIUS_ACCESS_ACCEPT = 0x00080000,
 	REDIS_EV_RADIUS_COA           = 0x00100000,
+	REDIS_EV_5G_REGISTRATION      = 0x00200000,
+	REDIS_EV_5G_DEREGISTRATION    = 0x00400000,
 };
 
 enum ap_redis_session_t {
@@ -84,13 +92,16 @@ struct ap_redis_msg_t {
 	char* username;
 	char* ip_addr;
 	char* sessionid;
+	char* circuit_id;
+	char* remote_id;
 	int pppoe_sessionid;
 	char* ctrl_ifname;
 	char* nas_identifier;
 };
 
 struct ap_redis_t {
-        mempool_t *msg_pool;
+	mempool_t *msg_pool;
+	mempool_t *sub_pool;
 	struct list_head entry;
 	struct list_head msg_queue;
 	spinlock_t msg_queue_lock;
@@ -103,8 +114,10 @@ struct ap_redis_t {
 
 	/* dedicated thread for running redis main loop */
 	pthread_t thread;
+	pthread_t sub_thread;
 	/* thread return value */
 	int thread_exit_code;
+	int sub_thread_exit_code;
 	/* flags */
 	uint32_t flags;
 
@@ -116,7 +129,7 @@ struct ap_redis_t {
 	uint16_t port;
 	/* redis channel (publish) */
 	char* pubchan;
-
+	char* subchan;
 	char* pathname;
 	uint32_t events;
 };
@@ -168,6 +181,8 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
 		case REDIS_EV_FORCE_INTERIM_UPDATE:     jstring = json_object_new_string("force-interim-update");   break;
 		case REDIS_EV_RADIUS_ACCESS_ACCEPT:     jstring = json_object_new_string("radius-access-accept");   break;
 		case REDIS_EV_RADIUS_COA:               jstring = json_object_new_string("coa");                    break;
+		case REDIS_EV_5G_REGISTRATION:          jstring = json_object_new_string("register");               break;
+		case REDIS_EV_5G_DEREGISTRATION:        jstring = json_object_new_string("deregister");             break;
 		default:                                jstring = json_object_new_string("unknown");                break;
 		}
 		json_object_object_add(jobj, "event", jstring);
@@ -215,6 +230,13 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
           	/* pppoe_sessionid */
 		if (msg->pppoe_sessionid)
 			json_object_object_add(jobj, "pppoe_sessionid", json_object_new_int(msg->pppoe_sessionid));
+		/*circuit_id */
+		if (msg->circuit_id)
+			json_object_object_add(jobj, "circuit_id", json_object_new_string(msg->circuit_id));
+
+		/*remote_id */
+		if (msg->remote_id)
+			json_object_object_add(jobj, "remote_id", json_object_new_string(msg->remote_id));
 
 		/* ctrl_ifname */
 		if (msg->ctrl_ifname)
@@ -228,6 +250,8 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
           // TODO: send msg to redis instance
 		redisReply* reply;
 		reply = redisCommand(ctx, "PUBLISH %s %s", ap_redis->pubchan, json_object_to_json_string(jobj));
+
+		log_msg ("\r\n Redis PUBLISH: %s ",json_object_to_json_string(jobj));
 
 		if (reply) {
 			// TODO
@@ -255,6 +279,10 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
 			free(msg->ctrl_ifname);
 		if (msg->nas_identifier)
 			free(msg->nas_identifier);
+		if (msg->circuit_id)
+			free(msg->circuit_id);
+		if (msg->remote_id)
+			free(msg->remote_id);
 
 		mempool_free(msg);
 	}
@@ -262,9 +290,97 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
 	spin_unlock(&ap_redis->msg_queue_lock);
 }
 
+void onMessage(redisAsyncContext * c, void *reply, void * privdata)
+{
+	int j;
+	redisReply * r = reply;
+	struct json_object* pppoe_id;
+	struct json_object* ip_addr;
+	struct json_object* ifname;
+	enum json_tokener_error error;
+        struct ap_session_msg_t* msg = NULL;
+
+	if (reply == NULL) return;
+
+	if (r->type == REDIS_REPLY_ARRAY) {
+		for (j = 0; j < r->elements; j++) {
+			if (j !=2)
+				continue;
+
+			if (r->element[j]->str == NULL)
+				continue;
+
+			log_debug ("%u) %s\n", j, r->element[j]->str);
+
+			json_object *jobj = json_tokener_parse_verbose(r->element[j]->str, &error);
+			if (error != json_tokener_success) {
+				printf("Parse error. \n");
+				return;
+			}
+
+			json_object_object_get_ex (jobj, "pppoe_id", &pppoe_id);
+			json_object_object_get_ex (jobj, "ip_addr", &ip_addr);
+			json_object_object_get_ex (jobj, "ctrl_ifname", &ifname);
+
+			msg = mempool_alloc(ap_redis->sub_pool);
+			if (!msg) {
+				log_error("ap_redis_enqueue: out of memory\n");
+				return;
+			}
+
+			memset(msg, 0, sizeof(struct ap_session_msg_t));
+
+			msg->pppoe_sessionid = json_object_get_int(pppoe_id);
+			strcpy (msg->ip_addr, json_object_get_string(ip_addr));
+			strcpy (msg->ifname, json_object_get_string(ifname));
+
+			if (! pppoe_interface_find (msg->ifname)) {
+				mempool_free(msg);
+				return;
+			}
+
+			list_add_tail(&(msg->entry), &conn_list);
+
+			triton_event_fire(EV_SES_5G_STARTED, msg);
+		}
+	}
+}
+static void* ap_redis_sub_thread(void* arg)
+{
+	struct event_base *base = event_base_new();
+
+	if (!arg) {
+		return NULL;
+	}
+	struct ap_redis_t* ap_sub_redis = (struct ap_redis_t*)arg;
+	ap_sub_redis->sub_thread_exit_code = -1;
+	/* establish connection to redis server */
+	redisAsyncContext *ctx;
+	ctx = redisAsyncConnect (ap_sub_redis->host, ap_sub_redis->port);
+	if ((ctx == NULL) || (ctx->err)) {
+		if (ctx) {
+			log_error("ap_redis: redisAsyncConnect failed: (%s)\n", ctx->errstr);
+		} else {
+			log_error("ap_redis: failed to allocate redis context\n");
+		}
+		return &(ap_sub_redis->sub_thread_exit_code);
+	}
+
+	redisLibeventAttach(ctx, base);
+	redisAsyncCommand(ctx, onMessage, NULL, "SUBSCRIBE accel-ppp-5g");
+	event_base_dispatch(base);
+
+	/* release redis context */
+	redisAsyncFree(ctx);
+
+	return &(ap_sub_redis->sub_thread_exit_code);
+}
 
 static void* ap_redis_thread(void* arg)
 {
+	uint64_t num = 1;
+	int nbytes;
+
 	if (!arg) {
 	    return NULL;
 	}
@@ -297,7 +413,7 @@ static void* ap_redis_thread(void* arg)
 	epev[0].events = EPOLLIN;
 	epev[0].data.fd = ap_redis->evfd;
 	if ((rc = epoll_ctl(epfd, EPOLL_CTL_ADD, ap_redis->evfd, epev)) < 0) {
-		log_error("ap_redis: epoll_ctl failed: %d (%s)\n", errno, strerror(errno));
+		log_error("ap_redis: epoll_ctl failed: %d (%s) exiting !!! \n", errno, strerror(errno));
 		return &(ap_redis->thread_exit_code);
 	}
 
@@ -317,9 +433,12 @@ static void* ap_redis_thread(void* arg)
 		}
 
 		for (unsigned int i = 0; i < 32; i++) {
-			if (epev[i].data.fd == ap_redis->evfd) {
-				ap_redis_dequeue(ap_redis, ctx);
+		    if (epev[i].data.fd == ap_redis->evfd) {
+			if ((nbytes = read(ap_redis->evfd, &num, sizeof(num))) != sizeof(num)) {
+			    log_error("ap_redis: failed to read event via eventfd\n");
 			}
+			ap_redis_dequeue(ap_redis, ctx);
+		    }
 		}
 	}
 
@@ -345,11 +464,22 @@ static void ap_redis_init(struct ap_redis_t *ap_redis)
 	ap_redis->pathname = NULL;
 	ap_redis->events = (REDIS_EV_SES_AUTHORIZED | REDIS_EV_SES_PRE_FINISHED);
 	ap_redis->msg_pool = mempool_create(sizeof(struct ap_redis_msg_t));
+
 	if (NULL == ap_redis->msg_pool) {
 		log_error("ap_redis: mempool creation failed\n");
 		return;
 	}
 	memset(ap_redis->msg_pool, 0, sizeof(*(ap_redis->msg_pool)));
+
+	ap_redis->sub_pool = mempool_create(sizeof(struct ap_session_msg_t));
+	if (NULL == ap_redis->sub_pool) {
+		log_error("ap_redis: mempool creation failed\n");
+		return;
+	}
+	memset(ap_redis->sub_pool, 0, sizeof(*(ap_redis->sub_pool)));
+	INIT_LIST_HEAD(&conn_list);
+
+
 }
 
 static int ap_redis_open(struct ap_redis_t *ap_redis)
@@ -381,6 +511,11 @@ static int ap_redis_open(struct ap_redis_t *ap_redis)
 		ap_redis->pubchan = _strdup(opt);
 	else
 		ap_redis->pubchan = _strdup(DEFAULT_REDIS_PUBCHAN);
+
+	if (((opt = conf_get_opt("redis", "subchan")) != NULL))
+		ap_redis->subchan = _strdup(opt);
+	else
+		ap_redis->subchan = _strdup(DEFAULT_REDIS_SUBCHAN);
 
 	if (((opt = conf_get_opt("redis", "ev_ses_starting")) != NULL) && (strcmp(opt, "yes") == 0))
 		ap_redis->events |= REDIS_EV_SES_STARTING;
@@ -422,9 +557,18 @@ static int ap_redis_open(struct ap_redis_t *ap_redis)
 		ap_redis->events |= REDIS_EV_RADIUS_ACCESS_ACCEPT;
 	if (((opt = conf_get_opt("redis", "ev_radius_coa")) != NULL) && (strcmp(opt, "yes") == 0))
 		ap_redis->events |= REDIS_EV_RADIUS_COA;
-
+	if (((opt = conf_get_opt("redis", "ev_5g_registration")) != NULL) && (strcmp(opt, "yes") == 0))
+	{
+		ap_redis->events |= REDIS_EV_5G_REGISTRATION;
+		ap_redis->events |= REDIS_EV_5G_DEREGISTRATION;
+	}
 
 	if (pthread_create(&(ap_redis->thread), NULL, &ap_redis_thread, ap_redis) < 0) {
+		log_emerg("ap_redis: unable to create background thread %d (%s)\n", errno, strerror(errno));
+		return -1;
+	}
+
+	if (pthread_create(&(ap_redis->sub_thread), NULL, &ap_redis_sub_thread, ap_redis) < 0) {
 		log_emerg("ap_redis: unable to create background thread %d (%s)\n", errno, strerror(errno));
 		return -1;
 	}
@@ -465,7 +609,9 @@ static void ap_redis_enqueue(struct ap_session *ses, const int event)
 	case REDIS_EV_WINS:
 	case REDIS_EV_FORCE_INTERIM_UPDATE:
 	case REDIS_EV_RADIUS_ACCESS_ACCEPT:
-	case REDIS_EV_RADIUS_COA: {
+	case REDIS_EV_RADIUS_COA: 
+	case REDIS_EV_5G_REGISTRATION:
+        case REDIS_EV_5G_DEREGISTRATION:{
 		/* do nothing */
 	} break;
 	default: {
@@ -501,6 +647,10 @@ static void ap_redis_enqueue(struct ap_session *ses, const int event)
 		msg->username = _strdup(ses->username);
 	if (ses->conn_pppoe_sid)
 		msg->pppoe_sessionid = ses->conn_pppoe_sid;
+	if (ses->circuit_id)
+		msg->circuit_id = _strdup(ses->circuit_id);
+	if (ses->remote_id)
+		msg->remote_id = _strdup(ses->remote_id);
 	if (ses->ctrl->ifname)
 		msg->ctrl_ifname = _strdup(ses->ctrl->ifname);
 
@@ -546,6 +696,20 @@ static void ev_ses_finishing(struct ap_session *ses)
 
 static void ev_ses_finished(struct ap_session *ses)
 {
+	struct ap_session_msg_t* msg = NULL; 
+
+	if (ap_redis->events & REDIS_EV_5G_REGISTRATION)
+	{
+		list_for_each_entry(msg, &conn_list, entry) {
+			if(ses->conn_pppoe_sid == msg->pppoe_sessionid)
+			{
+				list_del(&msg->entry);
+				mempool_free(msg);
+				break;
+			}
+		}
+	}
+
 	ap_redis_enqueue(ses, REDIS_EV_SES_FINISHED);
 }
 
@@ -599,6 +763,16 @@ static void ev_radius_coa(struct ap_session *ses)
 	ap_redis_enqueue(ses, REDIS_EV_RADIUS_COA);
 }
 
+static void ev_5g_registration(struct ap_session *ses)
+{
+       ap_redis_enqueue(ses, REDIS_EV_5G_REGISTRATION);
+}
+
+
+static void ev_5g_deregistration(struct ap_session *ses)
+{
+       ap_redis_enqueue(ses, REDIS_EV_5G_DEREGISTRATION);
+}
 
 static void init(void)
 {
@@ -646,6 +820,12 @@ static void init(void)
 		triton_event_register_handler(EV_RADIUS_ACCESS_ACCEPT, (triton_event_func)ev_radius_access_accept);
 	if (ap_redis->events & REDIS_EV_RADIUS_COA)
 		triton_event_register_handler(EV_RADIUS_COA, (triton_event_func)ev_radius_coa);
+	if (ap_redis->events &REDIS_EV_5G_REGISTRATION)
+		triton_event_register_handler(EV_5G_REGISTRATION, (triton_event_func)ev_5g_registration);
+	if (ap_redis->events & REDIS_EV_5G_DEREGISTRATION)
+	        triton_event_register_handler (EV_5G_DEREGISTRATION, (triton_event_func) ev_5g_deregistration);
+
+
 }
 
 DEFINE_INIT(1, init);

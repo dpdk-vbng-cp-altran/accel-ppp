@@ -16,7 +16,8 @@
 
 static LIST_HEAD(auth_handlers);
 static int extra_opt_len = 0;
-static int conf_noauth = 0;
+int __export conf_noauth = 0;
+extern int conf_ppp_5g_registration;
 
 static struct lcp_option_t *auth_init(struct ppp_lcp_t *lcp);
 static void auth_free(struct ppp_lcp_t *lcp, struct lcp_option_t *opt);
@@ -33,7 +34,6 @@ static void auth_layer_finish(struct ppp_layer_data_t *);
 static void auth_layer_free(struct ppp_layer_data_t *);
 
 static void __ppp_auth_started(struct ppp_t *ppp);
-
 struct auth_option_t
 {
 	struct lcp_option_t opt;
@@ -280,12 +280,19 @@ static void __ppp_auth_started(struct ppp_t *ppp)
 		return;
 
 	log_ppp_debug("auth_layer_started\n");
-	ppp_layer_started(ppp, &ad->ld);
 
+	if (!conf_ppp_5g_registration)
+  	    ppp_layer_started(ppp, &ad->ld);
 
 	log_ppp_info1("%s: authentication succeeded\n", ppp->ses.username);
 
 	triton_event_fire(EV_SES_AUTHORIZED, &ppp->ses);
+
+	if (conf_ppp_5g_registration)
+	{
+	        log_ppp_debug("trigger 5g register for : %s \n", ppp->ses.username);
+		triton_event_fire(EV_5G_REGISTRATION, &ad->ppp->ses);
+	}
 }
 
 int __export ppp_auth_succeeded(struct ppp_t *ppp, char *username)
@@ -360,6 +367,25 @@ static void ppp_auth_init()
 	lcp_option_register(&auth_opt_hnd);
 
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
+}
+
+struct auth_layer_data_t * __export get_auth_layer (struct ppp_t *ppp)
+{
+	struct auth_layer_data_t *ad;
+
+	ad = container_of(ppp_find_layer_data(ppp, &auth_layer), typeof(*ad), ld);
+
+        return ad;
+}
+
+void __export auth_layer_resume (struct ppp_t *ppp)
+{
+	struct auth_layer_data_t *ad;
+
+	ad = get_auth_layer (ppp); 
+
+	log_ppp_debug("auth_layer_resume\n");
+	ppp_layer_started(ad->ppp, &ad->ld);
 }
 
 DEFINE_INIT(3, ppp_auth_init);

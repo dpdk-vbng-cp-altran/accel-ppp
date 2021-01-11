@@ -11,10 +11,14 @@
 
 #include "ppp.h"
 #include "ppp_lcp.h"
+#include "ppp_auth.h"
+
 #include "events.h"
 #include "iputils.h"
 
 #include "memdebug.h"
+extern int conf_noauth;
+int __export conf_ppp_5g_registration;
 
 struct recv_opt_t
 {
@@ -163,11 +167,19 @@ static void lcp_layer_up(struct ppp_fsm_t *fsm)
 
 	log_ppp_debug("lcp_layer_started\n");
 
+	if ((conf_ppp_5g_registration)&& (conf_noauth))
+	{
+	        log_ppp_debug ("trigger 5g registration \n ");
+		triton_event_fire(EV_5G_REGISTRATION, &fsm->ppp->ses);
+	}
+
 	if (!lcp->started) {
 		lcp->started = 1;
-		ppp_layer_started(lcp->ppp, &lcp->ld);
+		if (!((conf_ppp_5g_registration)&& (conf_noauth)))
+			ppp_layer_started(lcp->ppp, &lcp->ld);
 	}
 	start_echo(lcp);
+
 }
 
 static void lcp_layer_down(struct ppp_fsm_t *fsm)
@@ -263,6 +275,7 @@ static void send_conf_ack(struct ppp_fsm_t *fsm)
 		log_ppp_info2("send [LCP ConfAck id=%x ]\n", lcp->fsm.recv_id);
 
 	ppp_chan_send(lcp->ppp, hdr, ntohs(hdr->len) + 2);
+
 }
 
 static void send_code_rej(struct ppp_fsm_t *fsm)
@@ -394,6 +407,7 @@ static int lcp_recv_conf_req(struct ppp_lcp_t *lcp, uint8_t *data, int size)
 
 	list_for_each_entry(ropt, &lcp->ropt_list, entry) {
 		list_for_each_entry(lopt, &lcp->options, entry) {
+                    log_msg("recv [LCP ConfReq id=%x lopt->id: %d ropt->hdr->id: %d ", lcp->fsm.recv_id,lopt->id,ropt->hdr->id);
 			if (lopt->id == ropt->hdr->id) {
 				if (conf_ppp_verbose) {
 					log_ppp_info2(" ");
@@ -413,6 +427,7 @@ static int lcp_recv_conf_req(struct ppp_lcp_t *lcp, uint8_t *data, int size)
 				log_ppp_info2(" ");
 				print_ropt(ropt);
 			}
+			log_msg ("LCP Config Rejected !!");
 			ropt->state=LCP_OPT_REJ;
 			ret=LCP_OPT_REJ;
 		}
@@ -900,6 +915,10 @@ static void load_config(void)
 		conf_echo_timeout = atoi(opt);
 	else
 		conf_echo_timeout = 0;
+	opt = conf_get_opt("ppp", "5g-registration-wanted");
+	if (opt)
+		conf_ppp_5g_registration = atoi(opt);
+
 }
 
 static void lcp_init(void)

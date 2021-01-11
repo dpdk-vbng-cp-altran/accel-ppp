@@ -3,6 +3,7 @@
 
 #include "ppp.h"
 #include "list.h"
+#include <stdbool.h>
 
 struct ipv4db_item_t
 {
@@ -10,6 +11,7 @@ struct ipv4db_item_t
 	in_addr_t addr;
 	in_addr_t peer_addr;
 	int mask;
+	bool is_5g_ipaddr;
 };
 
 struct ipv6db_addr_t

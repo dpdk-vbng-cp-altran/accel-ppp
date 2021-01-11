@@ -8,6 +8,7 @@
 
 struct ppp_auth_handler_t;
 
+
 struct auth_data_t
 {
 	struct list_head entry;
@@ -34,6 +35,7 @@ int ppp_auth_register_handler(struct ppp_auth_handler_t*);
 int ppp_auth_succeeded(struct ppp_t *ppp, char *username);
 void ppp_auth_failed(struct ppp_t *ppp, char *username);
 int ppp_auth_restart(struct ppp_t *ppp);
+struct auth_layer_data_t *get_auth_layer (struct ppp_t *ppp);
 
 #endif
 

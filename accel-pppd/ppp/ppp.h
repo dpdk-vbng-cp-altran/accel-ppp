@@ -38,7 +38,13 @@
 #define PPP_CHAP	0xc223	/* Cryptographic Handshake Auth. Protocol */
 #define PPP_CBCP	0xc029	/* Callback Control Protocol */
 #define PPP_EAP		0xc227	/* Extensible Authentication Protocol */
-
+extern struct list_head conn_list;
+struct ap_session_msg_t {
+	struct list_head entry;
+	int pppoe_sessionid;
+	char ip_addr[15];
+	char ifname[20];
+};
 struct ppp_t
 {
 	struct ap_session ses;

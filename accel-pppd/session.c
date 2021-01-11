@@ -14,7 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <linux/if.h>
-
+#include <stdbool.h>
 #include "triton.h"
 #include "log.h"
 #include "events.h"
@@ -209,6 +209,10 @@ void __export ap_session_finished(struct ap_session *ses)
 
 	if (ses->ipv4 && ses->ipv4->owner) {
 		ipdb_put_ipv4(ses, ses->ipv4);
+		ses->ipv4 = NULL;
+	}
+	else if (ses->ipv4 && ses->ipv4->is_5g_ipaddr == true) {
+		free (ses->ipv4);
 		ses->ipv4 = NULL;
 	}
 

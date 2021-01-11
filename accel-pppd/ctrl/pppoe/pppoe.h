@@ -8,6 +8,7 @@
 
 #include "rbtree.h"
 #include "crypto.h"
+#include "ppp.h"
 
 /* PPPoE codes */
 #define CODE_PADI           0x09
@@ -19,6 +20,8 @@
 
 /* PPPoE Tags */
 #define TAG_END_OF_LIST        0x0000
+#define TAG_CIRCUIT_ID         0x0001
+#define TAG_REMOTE_ID          0x0002
 #define TAG_SERVICE_NAME       0x0101
 #define TAG_AC_NAME            0x0102
 #define TAG_HOST_UNIQ          0x0103
@@ -47,6 +50,9 @@
 
 #define SECRET_LENGTH 16
 #define COOKIE_LENGTH 24
+#define CIRCUIT_ID_LENGTH 63
+#define REMOTE_ID_LENGTH 63
+
 
 struct pppoe_tag_t
 {
@@ -138,6 +144,9 @@ int dpado_parse(const char *str);
 struct rad_packet_t;
 int tr101_send_access_request(struct pppoe_tag *tr101, struct rad_packet_t *pack);
 int tr101_send_accounting_request(struct pppoe_tag *tr101, struct rad_packet_t *pack);
+
+void pppoe_session_resume(struct ap_session_msg_t* msg);
+int __export pppoe_interface_find (char *ifname);
 
 #endif
 

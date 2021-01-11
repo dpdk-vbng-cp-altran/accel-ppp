@@ -8,8 +8,11 @@
 
 //#define AP_SESSIONID_LEN 16
 #define AP_IFNAME_LEN 16
+#define CIRCUIT_ID_LENGTH 63
+#define REMOTE_ID_LENGTH 63
 
 #define AP_STATE_STARTING  1
+
 #define AP_STATE_ACTIVE    2
 #define AP_STATE_FINISHING 3
 #define AP_STATE_RESTORE   4
@@ -74,6 +77,8 @@ struct ap_session
 	char *ifname_rename;
 	int unit_idx;
 	int ifindex;
+	char circuit_id [CIRCUIT_ID_LENGTH];
+	char remote_id [REMOTE_ID_LENGTH];
 	char sessionid[AP_SESSIONID_LEN+1];
 	time_t start_time;
 	time_t stop_time;
@@ -85,7 +90,6 @@ struct ap_session
 	char *ipv4_pool_name;
 	char *ipv6_pool_name;
 	struct ap_net *net;
-
 	const struct ap_ctrl *ctrl;
 
 	const char *comp;
