@@ -107,6 +107,9 @@ struct local_net {
 
 enum {SID_MAC, SID_IP};
 
+int register_5g = 0;
+static int conf_ipoe_5g_registration;
+struct triton_context_t resume_ctx;
 static int conf_check_exists;
 static int conf_dhcpv4 = 1;
 static int conf_up;
@@ -179,6 +182,7 @@ static unsigned int stat_active;
 static unsigned int stat_delayed_offer;
 
 static mempool_t ses_pool;
+static mempool_t ipoe_pool;
 static mempool_t disc_item_pool;
 static mempool_t arp_item_pool;
 static mempool_t req_item_pool;
@@ -236,6 +240,9 @@ static struct ipoe_session *ipoe_session_lookup(struct ipoe_serv *serv, struct d
 
 	uint8_t *agent_circuit_id = NULL;
 	uint8_t *agent_remote_id = NULL;
+	uint32_t circuit_len;
+	uint32_t remote_len;
+
 	int opt82_match;
 
 	if (opt82_ses)
@@ -252,7 +259,7 @@ static struct ipoe_session *ipoe_session_lookup(struct ipoe_serv *serv, struct d
 		return ses;
 	}
 
-	if (!conf_check_mac_change || (pack->relay_agent && dhcpv4_parse_opt82(pack->relay_agent, &agent_circuit_id, &agent_remote_id))) {
+	if (!conf_check_mac_change || (pack->relay_agent && dhcpv4_parse_opt82(pack->relay_agent, &agent_circuit_id, &agent_remote_id, &circuit_len, &remote_len))) {
 		agent_circuit_id = NULL;
 		agent_remote_id = NULL;
 	}
@@ -320,7 +327,6 @@ static struct ipoe_session *ipoe_session_lookup(struct ipoe_serv *serv, struct d
 
 	if (!res || !pack->relay_agent || !opt82_ses || *opt82_ses)
 		return res;
-
 	list_for_each_entry(ses, &serv->sessions, entry) {
 		if (agent_circuit_id && !ses->agent_circuit_id)
 			continue;
@@ -351,6 +357,7 @@ static struct ipoe_session *ipoe_session_lookup(struct ipoe_serv *serv, struct d
 		}
 
 		*opt82_ses = ses;
+		
 		break;
 	}
 
@@ -361,7 +368,8 @@ static void ipoe_session_timeout(struct triton_timer_t *t)
 {
 	struct ipoe_session *ses = container_of(t, typeof(*ses), timer);
 
-	triton_timer_del(t);
+	if (ses->timer.tpd)
+	    triton_timer_del(t);
 
 	log_ppp_info2("ipoe: session timed out\n");
 
@@ -395,7 +403,7 @@ static void ipoe_relay_timeout(struct triton_timer_t *t)
 
 		ap_session_terminate(&ses->ses, TERM_LOST_CARRIER, 1);
 	} else
-		dhcpv4_relay_send(ses->serv->dhcpv4_relay, ses->dhcpv4_request, ses->relay_server_id, ses->serv->ifname, conf_agent_remote_id);
+		dhcpv4_relay_send(ses->serv->dhcpv4_relay, ses->dhcpv4_request, ses->relay_server_id, ses->serv->ifname, conf_agent_remote_id, ses);
 }
 
 
@@ -656,11 +664,50 @@ cont:
 	ap_session_set_ifindex(&ses->ses);
 
 	if (ses->dhcpv4_request && ses->serv->dhcpv4_relay) {
-		dhcpv4_relay_send(ses->serv->dhcpv4_relay, ses->dhcpv4_request, ses->relay_server_id, ses->serv->ifname, conf_agent_remote_id);
+		if (conf_ipoe_5g_registration)
+		{
+			struct ap_session_ipoe_msg_t* ipoe_msg = mempool_alloc(ipoe_pool);
 
-		ses->timer.expire = ipoe_relay_timeout;
-		ses->timer.period = conf_relay_timeout * 1000;
-		triton_timer_add(&ses->ctx, &ses->timer, 0);
+			if (!ipoe_msg) {
+				log_error(" out of memory\n");
+				return;
+			}
+			memset(ipoe_msg, 0, sizeof(struct ap_session_ipoe_msg_t));
+
+			ipoe_msg->xid = ses->dhcpv4_request->hdr->xid;
+			ipoe_msg->ses = ses;
+			ipoe_msg->session_id = strdup(ses->ses.sessionid);
+
+			list_add_tail (&ipoe_msg->entry, &ses->serv->ipoe_list);
+
+			log_msg ("Initiate 5G Registration for circuid id: %s remote id: %s\n",ses->ses.circuit_id, ses->ses.remote_id); 
+			triton_event_fire(EV_5G_REGISTRATION, &ses->ses);
+
+			ses->timer.expire = ipoe_relay_timeout;
+			ses->timer.period = conf_relay_timeout * 1000;
+			triton_timer_add(&ses->ctx, &ses->timer, 0);
+
+			if ((conf_ipoe_5g_registration) && (register_5g == 0))
+			{
+				triton_event_register_handler(EV_SES_5G_REGISTERED, 
+                                             (triton_event_func)ipoe_session_resume);
+				triton_context_register(&resume_ctx, NULL);
+	                        triton_context_wakeup(&resume_ctx);
+				register_5g = 1;
+			}
+			else
+			{
+				log_msg ("Discarding Discover Packets\n");
+				return;
+			}
+		}
+		else
+		{
+			dhcpv4_relay_send(ses->serv->dhcpv4_relay, ses->dhcpv4_request, ses->relay_server_id, ses->serv->ifname, conf_agent_remote_id, ses);
+			ses->timer.expire = ipoe_relay_timeout;
+			ses->timer.period = conf_relay_timeout * 1000;
+			triton_timer_add(&ses->ctx, &ses->timer, 0);
+		}
 	} else
 		__ipoe_session_start(ses);
 }
@@ -919,7 +966,7 @@ static void __ipoe_session_start(struct ipoe_session *ses)
 		}
 	}
 
-	ses->timer.expire = ipoe_session_timeout;
+		ses->timer.expire = ipoe_session_timeout;
 	ses->timer.period = 0;
 	ses->timer.expire_tv.tv_sec = conf_offer_timeout;
 	triton_timer_add(&ses->ctx, &ses->timer, 0);
@@ -1047,7 +1094,7 @@ static void ipoe_session_activate(struct dhcpv4_packet *pack)
 	ses->dhcpv4_request = pack;
 
 	if (ses->serv->dhcpv4_relay)
-		dhcpv4_relay_send(ses->serv->dhcpv4_relay, ses->dhcpv4_request, ses->relay_server_id, ses->serv->ifname, conf_agent_remote_id);
+		dhcpv4_relay_send(ses->serv->dhcpv4_relay, ses->dhcpv4_request, ses->relay_server_id, ses->serv->ifname, conf_agent_remote_id, ses);
 	else
 		__ipoe_session_activate(ses);
 }
@@ -1067,7 +1114,7 @@ static void ipoe_session_keepalive(struct dhcpv4_packet *pack)
 	ses->xid = ses->dhcpv4_request->hdr->xid;
 
 	if (/*ses->ses.state == AP_STATE_ACTIVE &&*/ ses->serv->dhcpv4_relay) {
-		dhcpv4_relay_send(ses->serv->dhcpv4_relay, ses->dhcpv4_request, ses->relay_server_id, ses->serv->ifname, conf_agent_remote_id);
+		dhcpv4_relay_send(ses->serv->dhcpv4_relay, ses->dhcpv4_request, ses->relay_server_id, ses->serv->ifname, conf_agent_remote_id, ses);
 		return;
 	}
 
@@ -1090,7 +1137,7 @@ static void ipoe_session_decline(struct dhcpv4_packet *pack)
 	}
 
 	if (pack->msg_type == DHCPDECLINE && ses->serv->dhcpv4_relay)
-		dhcpv4_relay_send(ses->serv->dhcpv4_relay, pack, 0, ses->serv->ifname, conf_agent_remote_id);
+		dhcpv4_relay_send(ses->serv->dhcpv4_relay, pack, 0, ses->serv->ifname, conf_agent_remote_id, ses);
 
 	dhcpv4_packet_free(pack);
 
@@ -1164,6 +1211,7 @@ static void ipoe_session_finished(struct ap_session *s)
 	struct ipoe_session *ses = container_of(s, typeof(*ses), ses);
 	struct ipoe_serv *serv = ses->serv;
 	struct unit_cache *uc;
+	struct ap_session_ipoe_msg_t* msg;
 	struct ifreq ifr;
 
 	log_ppp_info1("ipoe: session finished\n");
@@ -1208,6 +1256,12 @@ static void ipoe_session_finished(struct ap_session *s)
 		dhcpv4_free(ses->dhcpv4);
 
 	triton_event_fire(EV_CTRL_FINISHED, s);
+
+        if (conf_ipoe_5g_registration)
+	{
+		log_msg ("5G Deregistration for circuit id: %s remote id: %s \n", ses->ses.circuit_id, ses->ses.remote_id);
+		triton_event_fire (EV_5G_DEREGISTRATION, &ses->ses);
+	}
 
 	if (s->ifindex == ses->serv->ifindex && strcmp(s->ifname, ses->serv->ifname)) {
 		int flags;
@@ -1297,6 +1351,8 @@ static struct ipoe_session *ipoe_session_create_dhcpv4(struct ipoe_serv *serv, s
 	struct ipoe_session *ses;
 	int dlen = 0;
 	uint8_t *ptr = NULL;
+	uint32_t circuit_len = 0;
+	uint32_t remote_len = 0;
 
 	if (ap_shutdown)
 		return NULL;
@@ -1348,8 +1404,16 @@ static struct ipoe_session *ipoe_session_create_dhcpv4(struct ipoe_serv *serv, s
 		ses->relay_agent->data = (uint8_t *)(ses->relay_agent + 1);
 		memcpy(ses->relay_agent->data, pack->relay_agent->data, pack->relay_agent->len);
 		ptr += sizeof(struct dhcpv4_option) + pack->relay_agent->len;
-		if (dhcpv4_parse_opt82(ses->relay_agent, &ses->agent_circuit_id, &ses->agent_remote_id))
+		if (dhcpv4_parse_opt82(ses->relay_agent, &ses->agent_circuit_id, &ses->agent_remote_id,
+					&circuit_len, &remote_len))
 			ses->relay_agent = NULL;
+		memset (ses->ses.circuit_id, 0, CIRCUIT_ID_LENGTH);
+		memset (ses->ses.remote_id, 0, REMOTE_ID_LENGTH);
+		memcpy(ses->ses.circuit_id, ses->agent_circuit_id + 1, circuit_len);
+		ses->ses.circuit_id[circuit_len+1] = '\0';
+		memcpy(ses->ses.remote_id, ses->agent_remote_id + 1, remote_len);
+		ses->ses.remote_id[remote_len+1] = '\0';
+		ses->ses.xid = ses->xid;
 	}
 
 	ses->ctrl.dont_ifcfg = 1;
@@ -1359,7 +1423,7 @@ static struct ipoe_session *ipoe_session_create_dhcpv4(struct ipoe_serv *serv, s
 
 	ptr = ses->hwaddr;
 	sprintf(ses->ctrl.calling_station_id, "%02x:%02x:%02x:%02x:%02x:%02x",
-		ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5]);
+			ptr[0], ptr[1], ptr[2], ptr[3], ptr[4], ptr[5]);
 
 	ses->ses.ctrl = &ses->ctrl;
 	ses->ses.chan_name = ses->ctrl.calling_station_id;
@@ -1402,6 +1466,8 @@ static void ipoe_ses_recv_dhcpv4(struct dhcpv4_serv *dhcpv4, struct dhcpv4_packe
 	int opt82_match;
 	uint8_t *agent_circuit_id = NULL;
 	uint8_t *agent_remote_id = NULL;
+	uint32_t circuit_len = 0;
+	uint32_t remote_len = 0;
 
 	if (conf_verbose) {
 		log_ppp_info2("recv ");
@@ -1415,7 +1481,8 @@ static void ipoe_ses_recv_dhcpv4(struct dhcpv4_serv *dhcpv4, struct dhcpv4_packe
 		return;
 	}
 
-	if (pack->relay_agent && dhcpv4_parse_opt82(pack->relay_agent, &agent_circuit_id, &agent_remote_id)) {
+	if (pack->relay_agent && dhcpv4_parse_opt82(pack->relay_agent, &agent_circuit_id, &agent_remote_id,
+						&circuit_len, &remote_len)) {
 		agent_circuit_id = NULL;
 		agent_remote_id = NULL;
 	}
@@ -1476,7 +1543,7 @@ static void ipoe_ses_recv_dhcpv4(struct dhcpv4_serv *dhcpv4, struct dhcpv4_packe
 			if (pack->server_id == ses->siaddr)
 				dhcpv4_send_nak(dhcpv4, pack);
 			else if (ses->serv->dhcpv4_relay)
-				dhcpv4_relay_send(ses->serv->dhcpv4_relay, pack, 0, ses->serv->ifname, conf_agent_remote_id);
+				dhcpv4_relay_send(ses->serv->dhcpv4_relay, pack, 0, ses->serv->ifname, conf_agent_remote_id, ses);
 
 			triton_context_call(ses->ctrl.ctx, (triton_event_func)__ipoe_session_terminate, &ses->ses);
 		} else {
@@ -1994,6 +2061,7 @@ static void ipoe_recv_dhcpv4_relay(struct dhcpv4_packet *pack)
 
 	pthread_mutex_lock(&serv->lock);
 	list_for_each_entry(ses, &serv->sessions, entry) {
+
 		if (ses->xid != pack->hdr->xid)
 			continue;
 		if (memcmp(ses->hwaddr, pack->hdr->chaddr, 6))
@@ -2002,7 +2070,6 @@ static void ipoe_recv_dhcpv4_relay(struct dhcpv4_packet *pack)
 		found = 1;
 		break;
 	}
-
 	if (found) {
 		triton_context_call(&ses->ctx, (triton_event_func)ipoe_ses_recv_dhcpv4_relay, pack);
 	} else
@@ -2046,6 +2113,7 @@ static struct ipoe_session *ipoe_session_create_up(struct ipoe_serv *serv, struc
 		strncpy(ses->ses.ifname, serv->ifname, AP_IFNAME_LEN);
 
 	ses->ctrl.called_station_id = _strdup(serv->ifname);
+
 
 	if (conf_calling_sid == SID_MAC) {
 		ses->ctrl.calling_station_id = _malloc(19);
@@ -2204,6 +2272,7 @@ void ipoe_recv_up(int ifindex, struct ethhdr *eth, struct iphdr *iph, struct _ar
 
 		break;
 	}
+
 	pthread_mutex_unlock(&serv_lock);
 }
 
@@ -2961,7 +3030,6 @@ static void add_interface(const char *ifname, int ifindex, const char *opt, int 
 		struct sockaddr_in addr;
 		int sock;
 		socklen_t len = sizeof(addr);
-
 		memset(&addr, 0, sizeof(addr));
 		addr.sin_family = AF_INET;
 		addr.sin_addr.s_addr = relay_addr;
@@ -3009,7 +3077,7 @@ static void add_interface(const char *ifname, int ifindex, const char *opt, int 
 		}
 
 		if (!serv->dhcpv4_relay && serv->opt_dhcpv4 && opt_relay)
-			serv->dhcpv4_relay = dhcpv4_relay_create(opt_relay, opt_giaddr, &serv->ctx, (triton_event_func)ipoe_recv_dhcpv4_relay);
+			serv->dhcpv4_relay = dhcpv4_relay_create(opt_relay, opt_giaddr, &serv->ctx, (triton_event_func)ipoe_recv_dhcpv4_relay, conf_ipoe_5g_registration);
 
 		if (serv->arp && !opt_arp) {
 			arpd_stop(serv->arp);
@@ -3128,6 +3196,7 @@ static void add_interface(const char *ifname, int ifindex, const char *opt, int 
 	serv->vid = vid;
 	serv->active = 1;
 	INIT_LIST_HEAD(&serv->sessions);
+   	INIT_LIST_HEAD(&serv->ipoe_list);
 	INIT_LIST_HEAD(&serv->disc_list);
 	INIT_LIST_HEAD(&serv->arp_list);
 	INIT_LIST_HEAD(&serv->req_list);
@@ -3142,7 +3211,7 @@ static void add_interface(const char *ifname, int ifindex, const char *opt, int 
 			serv->dhcpv4->recv = ipoe_recv_dhcpv4;
 
 		if (opt_relay)
-			serv->dhcpv4_relay = dhcpv4_relay_create(opt_relay, opt_giaddr, &serv->ctx, (triton_event_func)ipoe_recv_dhcpv4_relay);
+			serv->dhcpv4_relay = dhcpv4_relay_create(opt_relay, opt_giaddr, &serv->ctx, (triton_event_func)ipoe_recv_dhcpv4_relay, conf_ipoe_5g_registration);
 	}
 
 	if (serv->opt_arp)
@@ -3666,6 +3735,18 @@ out_err:
 	log_error("ipoe: failed to parse 'local-net=%s'\n", opt);
 }
 
+struct ap_session_ipoe_msg_t * find_channel_from_session(struct ipoe_serv *serv, const char *sessionid)
+{
+	struct ap_session_ipoe_msg_t* session = NULL;
+
+	list_for_each_entry(session, &serv->ipoe_list, entry) {
+		if (strcmp (sessionid, session->session_id) == 0)
+			return session;
+	}
+
+	return NULL;
+}
+
 static void load_local_nets(struct conf_sect_t *sect)
 {
 	struct conf_option_t *opt;
@@ -3875,6 +3956,9 @@ static void load_config(void)
 	else
 		conf_noauth = 0;
 
+        opt = conf_get_opt("ipoe", "5g-registration-wanted");
+        if (opt)                                                                                                                        conf_ipoe_5g_registration = atoi(opt);
+
 	conf_dhcpv4 = 0;
 	conf_up = 0;
 
@@ -3996,6 +4080,7 @@ static struct triton_timer_t l4_redirect_timer = {
 static void ipoe_init(void)
 {
 	ses_pool = mempool_create(sizeof(struct ipoe_session));
+        ipoe_pool = mempool_create(sizeof(struct ap_session_ipoe_msg_t));
 	disc_item_pool = mempool_create(sizeof(struct disc_item));
 	arp_item_pool = mempool_create(sizeof(struct arp_item));
 	req_item_pool = mempool_create(sizeof(struct request_item));
@@ -4023,6 +4108,39 @@ static void ipoe_init(void)
 
 	connlimit_loaded = triton_module_loaded("connlimit");
 	radius_loaded = triton_module_loaded("radius");
+}
+
+void __ipoe_session_resume (char *sessionid)
+{
+	struct ipoe_serv *serv = NULL;
+	struct ap_session_ipoe_msg_t* session = NULL;
+
+	pthread_mutex_lock (&serv_lock);
+	list_for_each_entry(serv, &serv_list, entry) {
+		session = find_channel_from_session (serv, sessionid);
+		if (session) {
+		        if (strcmp (sessionid, session->session_id) == 0)
+			{
+				dhcpv4_relay_send(session->ses->serv->dhcpv4_relay, session->ses->dhcpv4_request, 
+						session->ses->relay_server_id, 
+						session->ses->serv->ifname, conf_agent_remote_id, session->ses);
+				list_del (&session->entry);
+                                free(session->session_id);
+				mempool_free(session);
+				break;
+			}
+		}
+		else
+		{
+			log_msg ("\r\n session is not found \n");
+		}
+	}
+	pthread_mutex_unlock (&serv_lock);
+}
+
+void __export ipoe_session_resume (char *sessionid)
+{
+        triton_context_call(&resume_ctx, (triton_event_func)__ipoe_session_resume, sessionid);
 }
 
 DEFINE_INIT(52, ipoe_init);

@@ -418,7 +418,8 @@ void dhcpv4_packet_free(struct dhcpv4_packet *pack)
 	mempool_free(pack);
 }
 
-int dhcpv4_parse_opt82(struct dhcpv4_option *opt, uint8_t **agent_circuit_id, uint8_t **agent_remote_id)
+int dhcpv4_parse_opt82(struct dhcpv4_option *opt, uint8_t **agent_circuit_id, uint8_t **agent_remote_id,
+		uint32_t *circuit_len, uint32_t *remote_len)
 {
 	uint8_t *ptr = opt->data;
 	uint8_t *endptr = ptr + opt->len;
@@ -432,10 +433,15 @@ int dhcpv4_parse_opt82(struct dhcpv4_option *opt, uint8_t **agent_circuit_id, ui
 			return -1;
 
 		if (type == 1)
+		{
+			*circuit_len = len;
 			*agent_circuit_id = ptr - 1;
+		}
 		else if (type == 2)
+		{
+			*remote_len = len;
 			*agent_remote_id = ptr - 1;
-
+		}
 		ptr += len;
 	}
 
@@ -556,6 +562,51 @@ static int dhcpv4_relay_read(struct triton_md_handler_t *h)
 	}
 }
 
+int dhcpv4_relay_redis_read (uint8_t *pkt)
+{
+	struct dhcpv4_packet *pack;
+	struct dhcpv4_relay *r;
+	struct dhcpv4_relay_ctx *c;
+	int len = 0;
+
+	pack = dhcpv4_packet_alloc();
+	if (!pack) {
+		log_emerg("out of memory\n");
+		return 1;
+	}
+
+	memcpy (pack->data, (pkt+sizeof(int)), 1024);
+
+	memcpy (&len, pkt, sizeof(int));
+
+	if (dhcpv4_parse_packet(pack, len)) {
+		dhcpv4_packet_free(pack);
+		return 1;
+	}
+
+	if (pack->hdr->op != DHCP_OP_REPLY) {
+		dhcpv4_packet_free(pack);
+		return 1;
+	}
+
+	pthread_mutex_lock(&relay_lock);
+
+	list_for_each_entry(r, &relay_list, entry) {
+		list_for_each_entry(c, &r->ctx_list, entry) {
+			dhcpv4_packet_ref(pack);
+			triton_context_call(c->ctx, c->recv, pack);
+		}
+	}
+
+	pthread_mutex_unlock(&relay_lock);
+
+	dhcpv4_packet_free(pack);
+
+	return 1;
+}
+#if 0
+		if (r->addr == pack->hdr->ciaddr && r->giaddr == pack->hdr->giaddr) {
+#endif
 
 uint16_t ip_csum(uint16_t *buf, int len)
 {
@@ -870,7 +921,7 @@ void dhcpv4_send_notify(struct dhcpv4_serv *serv, struct dhcpv4_packet *req, uns
 	dhcpv4_packet_free(pack);
 }
 
-struct dhcpv4_relay *dhcpv4_relay_create(const char *_addr, in_addr_t giaddr, struct triton_context_t *ctx, triton_event_func recv)
+struct dhcpv4_relay *dhcpv4_relay_create(const char *_addr, in_addr_t giaddr, struct triton_context_t *ctx, triton_event_func recv, int conf_ipoe_5g_registration)
 {
 	char str[17], *ptr;
 	struct dhcpv4_relay *r;
@@ -922,18 +973,20 @@ struct dhcpv4_relay *dhcpv4_relay_create(const char *_addr, in_addr_t giaddr, st
 	if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &f, sizeof(f)))
 		log_error("dhcpv4: setsockopt(SO_REUSEADDR): %s\n", strerror(errno));
 
-	if (bind(sock, &laddr, sizeof(laddr))) {
+	if (!conf_ipoe_5g_registration){
+	    if (bind(sock, &laddr, sizeof(laddr))) {
 		log_error("dhcpv4: relay: %s: bind: %s\n", _addr, strerror(errno));
 		goto out_err_unlock;
-	}
+	    }
 
-	if (connect(sock, &raddr, sizeof(raddr))) {
+	    if (connect(sock, &raddr, sizeof(raddr))) {
 		log_error("dhcpv4: relay: %s: connect: %s\n", _addr, strerror(errno));
 		goto out_err_unlock;
-	}
+	    }
 
-	fcntl(sock, F_SETFL, O_NONBLOCK);
-	fcntl(sock, F_SETFD, fcntl(sock, F_GETFD) | FD_CLOEXEC);
+	    fcntl(sock, F_SETFL, O_NONBLOCK);
+	    fcntl(sock, F_SETFD, fcntl(sock, F_GETFD) | FD_CLOEXEC);
+	}
 
 	r->hnd.fd = sock;
 	r->hnd.read = dhcpv4_relay_read;
@@ -944,6 +997,8 @@ struct dhcpv4_relay *dhcpv4_relay_create(const char *_addr, in_addr_t giaddr, st
 	triton_md_register_handler(&r->ctx, &r->hnd);
 	triton_md_enable_handler(&r->hnd, MD_MODE_READ);
 	triton_context_wakeup(&r->ctx);
+
+	triton_event_register_handler(EV_5G_DHCP_PKT_RCVD, (triton_event_func)dhcpv4_relay_redis_read);
 
 	list_add_tail(&r->entry, &relay_list);
 
@@ -993,9 +1048,11 @@ void dhcpv4_relay_free(struct dhcpv4_relay *r, struct triton_context_t *ctx)
 	pthread_mutex_unlock(&relay_lock);
 }
 
-int dhcpv4_relay_send(struct dhcpv4_relay *relay, struct dhcpv4_packet *request, uint32_t server_id, const char *agent_circuit_id, const char *agent_remote_id)
+int registration_wanted = 1;
+
+int dhcpv4_relay_send(struct dhcpv4_relay *relay, struct dhcpv4_packet *request, uint32_t server_id, const char *agent_circuit_id, const char *agent_remote_id, struct ipoe_session *ses)
 {
-	int n;
+	int n = 0;
 	int len = request->ptr - request->data;
 	uint32_t giaddr = request->hdr->giaddr;
 	struct dhcpv4_option *opt = NULL;
@@ -1020,15 +1077,31 @@ int dhcpv4_relay_send(struct dhcpv4_relay *relay, struct dhcpv4_packet *request,
 	}
 
 	len = request->ptr - request->data;
-	n = write(relay->hnd.fd, request->data, len);
+
+	if (registration_wanted)
+	{
+		ses->ses.data = request->data;
+		ses->ses.len = len;
+		ses->ses.giaddr = relay->giaddr;
+		ses->ses.siaddr = relay->addr;
+
+		triton_event_fire(EV_5G_PACKET, &ses->ses);
+	}
+	else
+	{
+		n = write(relay->hnd.fd, request->data, len);
+	}
 
 	request->hdr->giaddr = giaddr;
 
 	if (opt)
 		*(uint32_t *)opt->data = _server_id;
 
-	if (n != len)
-		return -1;
+	if (!registration_wanted)
+	{
+		if (n != len)
+			return -1;
+	}
 
 	return 0;
 }

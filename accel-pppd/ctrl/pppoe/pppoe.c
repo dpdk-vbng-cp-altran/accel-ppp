@@ -508,7 +508,7 @@ static struct pppoe_conn_t *find_channel(struct pppoe_serv_t *serv, const uint8_
 
 	return NULL;
 }
-struct pppoe_conn_t * __export find_channel_from_session(struct pppoe_serv_t *serv, const int session_id)
+struct pppoe_conn_t * find_channel_from_session(struct pppoe_serv_t *serv, const int session_id)
 {
         struct pppoe_conn_t *conn;
 

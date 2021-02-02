@@ -39,6 +39,7 @@
 #define PPP_CBCP	0xc029	/* Callback Control Protocol */
 #define PPP_EAP		0xc227	/* Extensible Authentication Protocol */
 extern struct list_head conn_list;
+struct list_head __export ipoe_list;
 struct ap_session_msg_t {
 	struct list_head entry;
 	int pppoe_sessionid;
@@ -122,6 +123,7 @@ int ppp_register_layer(const char *name, struct ppp_layer_t *);
 void ppp_unregister_layer(struct ppp_layer_t *);
 struct ppp_layer_data_t *ppp_find_layer_data(struct ppp_t *, struct ppp_layer_t *);
 
+int __export pppoe_interface_find (char *ifname);
 extern int conf_ppp_verbose;
 
 #endif

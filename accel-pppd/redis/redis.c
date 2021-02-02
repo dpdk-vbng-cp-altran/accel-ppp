@@ -65,6 +65,7 @@ enum ap_redis_events_t {
 	REDIS_EV_RADIUS_COA           = 0x00100000,
 	REDIS_EV_5G_REGISTRATION      = 0x00200000,
 	REDIS_EV_5G_DEREGISTRATION    = 0x00400000,
+	REDIS_EV_5G_PACKET            = 0x00800000,
 };
 
 enum ap_redis_session_t {
@@ -94,9 +95,14 @@ struct ap_redis_msg_t {
 	char* sessionid;
 	char* circuit_id;
 	char* remote_id;
+	uint32_t xid;
 	int pppoe_sessionid;
 	char* ctrl_ifname;
 	char* nas_identifier;
+	uint8_t data[1500];
+	int   len;
+	int   giaddr;
+	int   siaddr;
 };
 
 struct ap_redis_t {
@@ -145,6 +151,22 @@ static struct ap_redis_t *ap_redis;
 
 static mempool_t redis_pool;
 
+void ap_construct_msg (uint8_t *dhcp_pkt, uint32_t pkt_len, json_object* jobj)
+{
+    uint8_t     *ptr; 
+
+    ptr = dhcp_pkt; 
+    json_object *jarray = json_object_new_array();
+
+    for (int i = 0; i< pkt_len; i++)
+    {
+	json_object *jint = json_object_new_int(*(ptr+i));
+	json_object_array_add(jarray,jint);
+    }
+
+    json_object_object_add(jobj,"packet", jarray);
+    return;
+}
 
 static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
 {
@@ -183,6 +205,7 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
 		case REDIS_EV_RADIUS_COA:               jstring = json_object_new_string("coa");                    break;
 		case REDIS_EV_5G_REGISTRATION:          jstring = json_object_new_string("register");               break;
 		case REDIS_EV_5G_DEREGISTRATION:        jstring = json_object_new_string("deregister");             break;
+		case REDIS_EV_5G_PACKET:                jstring = json_object_new_string("packet");                 break;
 		default:                                jstring = json_object_new_string("unknown");                break;
 		}
 		json_object_object_add(jobj, "event", jstring);
@@ -214,7 +237,6 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
 		/* calling_station_id */
 		if (msg->calling_station_id)
 			json_object_object_add(jobj, "calling_station_id", json_object_new_string(msg->calling_station_id));
-
 		/* name */
 		if (msg->name)
 			json_object_object_add(jobj, "name", json_object_new_string(msg->name));
@@ -230,6 +252,20 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
           	/* pppoe_sessionid */
 		if (msg->pppoe_sessionid)
 			json_object_object_add(jobj, "pppoe_sessionid", json_object_new_int(msg->pppoe_sessionid));
+
+                /* ipoe_xid */
+		if (msg->event == REDIS_EV_5G_REGISTRATION ||
+                    msg->event == REDIS_EV_5G_DEREGISTRATION)
+		{
+			json_object_object_add(jobj, "xid", json_object_new_int(msg->xid));
+		}
+
+		if (msg->giaddr)
+			json_object_object_add(jobj, "giaddr", json_object_new_int(msg->giaddr));
+
+		if (msg->siaddr)
+			json_object_object_add(jobj, "siaddr", json_object_new_int(msg->siaddr));
+
 		/*circuit_id */
 		if (msg->circuit_id)
 			json_object_object_add(jobj, "circuit_id", json_object_new_string(msg->circuit_id));
@@ -246,13 +282,14 @@ static void ap_redis_dequeue(struct ap_redis_t* ap_redis, redisContext* ctx)
                 if (msg->nas_identifier)
                         json_object_object_add(jobj, "nas_identifier", json_object_new_string(msg->nas_identifier));
 
+                if (msg->data)
+			ap_construct_msg (msg->data, msg->len, jobj);
 
           // TODO: send msg to redis instance
 		redisReply* reply;
 		reply = redisCommand(ctx, "PUBLISH %s %s", ap_redis->pubchan, json_object_to_json_string(jobj));
 
-		log_msg ("\r\n Redis PUBLISH: %s ",json_object_to_json_string(jobj));
-
+		log_msg (" Redis PUBLISH: %s \n",json_object_to_json_string(jobj));
 		if (reply) {
 			// TODO
 		}
@@ -297,10 +334,21 @@ void onMessage(redisAsyncContext * c, void *reply, void * privdata)
 	struct json_object* pppoe_id;
 	struct json_object* ip_addr;
 	struct json_object* ifname;
+	struct json_object* packet;
+	struct json_object* value;
+	struct json_object* iftype;
+	struct json_object *ipoe_xid;
+	struct json_object *ipoe_sessionid;
+	char sessionid[AP_SESSIONID_LEN+1];
 	enum json_tokener_error error;
         struct ap_session_msg_t* msg = NULL;
+	uint8_t pkt[1024];
+	int exists, i, len, skip_len;
+        int xid =0;
 
 	if (reply == NULL) return;
+
+	log_debug ("got a message of type: %i\n", r->type);
 
 	if (r->type == REDIS_REPLY_ARRAY) {
 		for (j = 0; j < r->elements; j++) {
@@ -318,33 +366,68 @@ void onMessage(redisAsyncContext * c, void *reply, void * privdata)
 				return;
 			}
 
-			json_object_object_get_ex (jobj, "pppoe_id", &pppoe_id);
-			json_object_object_get_ex (jobj, "ip_addr", &ip_addr);
-			json_object_object_get_ex (jobj, "ctrl_ifname", &ifname);
+			json_object_object_get_ex (jobj, "ctrl_iftype", &iftype);
+			if (strcmp (json_object_get_string(iftype), "pppoe") == 0)
+			{
+				json_object_object_get_ex (jobj, "pppoe_id", &pppoe_id);
+				json_object_object_get_ex (jobj, "ip_addr", &ip_addr);
+				json_object_object_get_ex (jobj, "ctrl_ifname", &ifname);
 
-			msg = mempool_alloc(ap_redis->sub_pool);
-			if (!msg) {
-				log_error("ap_redis_enqueue: out of memory\n");
-				return;
+				msg = mempool_alloc(ap_redis->sub_pool);
+				if (!msg) {
+					log_error("ap_redis_enqueue: out of memory\n");
+					return;
+				}
+
+				memset(msg, 0, sizeof(struct ap_session_msg_t));
+
+				msg->pppoe_sessionid = json_object_get_int(pppoe_id);
+				strcpy (msg->ip_addr, json_object_get_string(ip_addr));
+				strcpy (msg->ifname, json_object_get_string(ifname));
+
+				if (! pppoe_interface_find (msg->ifname)) {
+					mempool_free(msg);
+					return;
+				}
+
+				list_add_tail(&(msg->entry), &conn_list);
+
+				triton_event_fire(EV_SES_5G_STARTED, msg);
 			}
+			else if (strcmp (json_object_get_string(iftype), "ipoe") == 0)
+			{
+				exists = json_object_object_get_ex(jobj, "packet", &packet);
+				if (TRUE == exists)
+				{
+					memset (&pkt, 0, sizeof(pkt));
 
-			memset(msg, 0, sizeof(struct ap_session_msg_t));
+					/* Copying the packet length in first offset */
+					len = json_object_array_length(packet);
+					memcpy (&pkt, &len, sizeof(int));
+					skip_len = sizeof(int);
 
-			msg->pppoe_sessionid = json_object_get_int(pppoe_id);
-			strcpy (msg->ip_addr, json_object_get_string(ip_addr));
-			strcpy (msg->ifname, json_object_get_string(ifname));
+					for (i = 0; i < json_object_array_length(packet); i++ )
+					{
+						value = json_object_array_get_idx(packet, i);
+						pkt[i+skip_len] = (uint8_t) json_object_get_int(value);
+					}
 
-			if (! pppoe_interface_find (msg->ifname)) {
-				mempool_free(msg);
-				return;
+					triton_event_fire(EV_5G_DHCP_PKT_RCVD, &pkt);
+				}
+                                else
+				{
+					json_object_object_get_ex (jobj, "xid", &ipoe_xid);
+				        json_object_object_get_ex (jobj, "session_id", &ipoe_sessionid);
+				        strcpy (sessionid, json_object_get_string(ipoe_sessionid));
+
+					xid = json_object_get_int (ipoe_xid);
+					triton_event_fire (EV_SES_5G_REGISTERED, &sessionid);
+				}
 			}
-
-			list_add_tail(&(msg->entry), &conn_list);
-
-			triton_event_fire(EV_SES_5G_STARTED, msg);
 		}
 	}
 }
+
 static void* ap_redis_sub_thread(void* arg)
 {
 	struct event_base *base = event_base_new();
@@ -423,12 +506,11 @@ static void* ap_redis_thread(void* arg)
 
 	while (ap_redis->flags & REDIS_FLAG_KEEP_BG_THREAD_RUNNING) {
 
-		if ((rc = epoll_pwait(epfd, epev, 32, /*timeout=*/10, NULL)) == 0) {
+		if ((rc = epoll_wait(epfd, epev, 32, /*timeout=*/10)) == 0) {
 			/* no events, just loop and continue waiting */
 			continue;
 		} else if (rc == -1) {
 			/* log error event, loop and continue waiting */
-			log_error("ap_redis: epoll_ctl failed: %d (%s)\n", errno, strerror(errno));
 			continue;
 		}
 
@@ -441,6 +523,7 @@ static void* ap_redis_thread(void* arg)
 		    }
 		}
 	}
+
 
 	ap_redis->flags &= ~REDIS_FLAG_BG_THREAD_IS_RUNNING;
 
@@ -561,6 +644,7 @@ static int ap_redis_open(struct ap_redis_t *ap_redis)
 	{
 		ap_redis->events |= REDIS_EV_5G_REGISTRATION;
 		ap_redis->events |= REDIS_EV_5G_DEREGISTRATION;
+		ap_redis->events |= REDIS_EV_5G_PACKET;
 	}
 
 	if (pthread_create(&(ap_redis->thread), NULL, &ap_redis_thread, ap_redis) < 0) {
@@ -611,7 +695,8 @@ static void ap_redis_enqueue(struct ap_session *ses, const int event)
 	case REDIS_EV_RADIUS_ACCESS_ACCEPT:
 	case REDIS_EV_RADIUS_COA: 
 	case REDIS_EV_5G_REGISTRATION:
-        case REDIS_EV_5G_DEREGISTRATION:{
+        case REDIS_EV_5G_DEREGISTRATION:
+        case REDIS_EV_5G_PACKET:{
 		/* do nothing */
 	} break;
 	default: {
@@ -645,6 +730,8 @@ static void ap_redis_enqueue(struct ap_session *ses, const int event)
 		msg->name = _strdup(ses->ctrl->name);
 	if (ses->username)
 		msg->username = _strdup(ses->username);
+        if (ses->xid)
+                msg->xid = ses->xid;
 	if (ses->conn_pppoe_sid)
 		msg->pppoe_sessionid = ses->conn_pppoe_sid;
 	if (ses->circuit_id)
@@ -654,8 +741,21 @@ static void ap_redis_enqueue(struct ap_session *ses, const int event)
 	if (ses->ctrl->ifname)
 		msg->ctrl_ifname = _strdup(ses->ctrl->ifname);
 
+	if (msg->event == REDIS_EV_5G_PACKET){
+		if (ses->giaddr)
+			msg->giaddr = ses->giaddr;
+		if (ses->siaddr)
+			msg->siaddr = ses->siaddr;
+	}
+
     	msg->ip_addr = _strdup(tmp_addr);
 	msg->nas_identifier = _strdup(ap_redis->nas_id);
+
+	if (ses->data)
+	{
+		memcpy (msg->data, ses->data, ses->len);
+		msg->len = ses->len;
+	}
 
 	switch(ses->ctrl->type) {
 	case CTRL_TYPE_PPTP:    msg->ses_ctrl_type = REDIS_SES_CTRL_TYPE_PPTP;    break;
@@ -677,7 +777,6 @@ static void ap_redis_enqueue(struct ap_session *ses, const int event)
 		log_error("ap_redis_enqueue: failed to send event via eventfd\n");
 	}
 }
-
 
 static void ev_ses_starting(struct ap_session *ses)
 {
@@ -768,10 +867,14 @@ static void ev_5g_registration(struct ap_session *ses)
        ap_redis_enqueue(ses, REDIS_EV_5G_REGISTRATION);
 }
 
-
 static void ev_5g_deregistration(struct ap_session *ses)
 {
        ap_redis_enqueue(ses, REDIS_EV_5G_DEREGISTRATION);
+}
+
+static void ev_5g_packet(struct ap_session *ses)
+{
+       ap_redis_enqueue(ses, REDIS_EV_5G_PACKET);
 }
 
 static void init(void)
@@ -820,12 +923,16 @@ static void init(void)
 		triton_event_register_handler(EV_RADIUS_ACCESS_ACCEPT, (triton_event_func)ev_radius_access_accept);
 	if (ap_redis->events & REDIS_EV_RADIUS_COA)
 		triton_event_register_handler(EV_RADIUS_COA, (triton_event_func)ev_radius_coa);
-	if (ap_redis->events &REDIS_EV_5G_REGISTRATION)
+	if (ap_redis->events & REDIS_EV_5G_REGISTRATION)
 		triton_event_register_handler(EV_5G_REGISTRATION, (triton_event_func)ev_5g_registration);
 	if (ap_redis->events & REDIS_EV_5G_DEREGISTRATION)
 	        triton_event_register_handler (EV_5G_DEREGISTRATION, (triton_event_func) ev_5g_deregistration);
+	if (ap_redis->events & REDIS_EV_5G_PACKET)
+	        triton_event_register_handler (EV_5G_PACKET, (triton_event_func) ev_5g_packet);
 
 
 }
+
+
 
 DEFINE_INIT(1, init);

@@ -369,7 +369,7 @@ static void ppp_auth_init()
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
 }
 
-struct auth_layer_data_t * __export get_auth_layer (struct ppp_t *ppp)
+struct auth_layer_data_t * get_auth_layer (struct ppp_t *ppp)
 {
 	struct auth_layer_data_t *ad;
 

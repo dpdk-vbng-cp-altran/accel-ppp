@@ -7,6 +7,7 @@
 #include "list.h"
 
 #include "triton.h"
+#include "ipoe.h"
 
 #define __packed __attribute__((packed))
 
@@ -105,14 +106,15 @@ struct dhcpv4_relay {
 
 struct ap_session;
 struct rad_packet_t;
+struct ipoe_session;
 
 struct dhcpv4_serv *dhcpv4_create(struct triton_context_t *ctx, const char *ifname, const char *opt);
 void dhcpv4_free(struct dhcpv4_serv *);
 
-struct dhcpv4_relay *dhcpv4_relay_create(const char *addr, in_addr_t giaddr, struct triton_context_t *ctx, triton_event_func recv);
+struct dhcpv4_relay *dhcpv4_relay_create(const char *_addr, in_addr_t giaddr, struct triton_context_t *ctx, triton_event_func recv, int conf_ipoe_5g_registration);
 void dhcpv4_relay_free(struct dhcpv4_relay *, struct triton_context_t *);
 int dhcpv4_relay_send(struct dhcpv4_relay *relay, struct dhcpv4_packet *request, uint32_t server_id,
-	const char *agent_circuit_id, const char *agent_remote_id);
+	const char *agent_circuit_id, const char *agent_remote_id,  struct ipoe_session *ses);
 int dhcpv4_relay_send_release(struct dhcpv4_relay *relay, uint8_t *chaddr, uint32_t xid, uint32_t ciaddr,
 	struct dhcpv4_option *client_id, struct dhcpv4_option *relay_agent,
 	const char *agent_circuit_id, const char *agent_remote_id);
@@ -133,7 +135,8 @@ void dhcpv4_print_options(struct dhcpv4_packet *, void (*)(const char *, ...));
 
 void dhcpv4_print_packet(struct dhcpv4_packet *pack, int relay, void (*print)(const char *fmt, ...));
 
-int dhcpv4_parse_opt82(struct dhcpv4_option *opt, uint8_t **agent_circuit_id, uint8_t **agent_remote_id);
+int dhcpv4_parse_opt82(struct dhcpv4_option *opt, uint8_t **agent_circuit_id, uint8_t **agent_remote_id,
+		uint32_t *circuit_len, uint32_t *remote_len);
 
 int dhcpv4_get_ip(struct dhcpv4_serv *serv, uint32_t *yiaddr, uint32_t *siaddr, int *mask);
 void dhcpv4_put_ip(struct dhcpv4_serv *serv, uint32_t ip);

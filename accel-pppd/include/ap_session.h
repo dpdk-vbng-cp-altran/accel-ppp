@@ -77,6 +77,7 @@ struct ap_session
 	char *ifname_rename;
 	int unit_idx;
 	int ifindex;
+
 	char circuit_id [CIRCUIT_ID_LENGTH];
 	char remote_id [REMOTE_ID_LENGTH];
 	char sessionid[AP_SESSIONID_LEN+1];
@@ -90,6 +91,8 @@ struct ap_session
 	char *ipv4_pool_name;
 	char *ipv6_pool_name;
 	struct ap_net *net;
+	pthread_mutex_t lock;
+	struct triton_timer_t timer;
 	const struct ap_ctrl *ctrl;
 
 	const char *comp;
@@ -109,7 +112,6 @@ struct ap_session
 
 	int idle_timeout;
 	int session_timeout;
-	struct triton_timer_t timer;
 
 	uint32_t acct_rx_bytes;
 	uint32_t acct_tx_bytes;
@@ -120,7 +122,12 @@ struct ap_session
 	uint32_t acct_rx_bytes_i;
 	uint32_t acct_tx_bytes_i;
 	int acct_start;
-     int conn_pppoe_sid;
+	int      conn_pppoe_sid;
+	uint8_t  *data;
+	int      len;
+	uint32_t xid;
+	int      giaddr;
+	int      siaddr;
 };
 
 struct ap_session_stat
@@ -129,7 +136,6 @@ struct ap_session_stat
 	unsigned int starting;
 	unsigned int finishing;
 };
-
 
 extern pthread_rwlock_t ses_lock;
 extern struct list_head ses_list;

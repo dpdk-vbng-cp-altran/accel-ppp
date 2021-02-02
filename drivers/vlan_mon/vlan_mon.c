@@ -43,6 +43,10 @@
 #define vlan_tx_tag_present(skb) skb_vlan_tag_present(skb)
 #endif
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
+#define nla_nest_start_noflag(skb, attr) nla_nest_start(skb, attr)
+#endif
+
 struct vlan_dev {
 	unsigned int magic;
 	int ifindex;
@@ -198,13 +202,15 @@ static void vlan_do_notify(struct work_struct *w)
 #if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0) && RHEL_MAJOR < 7
 			header = genlmsg_put(report_skb, 0, vlan_mon_nl_mcg.id, &vlan_mon_nl_family, 0, VLAN_MON_NOTIFY);
 #else
-			header = genlmsg_put(report_skb, 0, vlan_mon_nl_family.mcgrp_offset, &vlan_mon_nl_family, 0, VLAN_MON_NOTIFY);
+			header = genlmsg_put(report_skb, 0, 0, &vlan_mon_nl_family, 0, VLAN_MON_NOTIFY);
+
 #endif
 		}
 
 		//pr_info("notify %i vlan %i\n", id, n->vid);
 
-		ns = nla_nest_start(report_skb, id++);
+		ns = nla_nest_start_noflag(report_skb, id++);
+
 		if (!ns)
 			goto nl_err;
 
@@ -616,7 +622,7 @@ static int vlan_mon_nl_cmd_check_busy(struct sk_buff *skb, struct genl_info *inf
 	return ret;
 }
 
-static struct nla_policy vlan_mon_nl_policy[VLAN_MON_ATTR_MAX + 1] = {
+static const struct nla_policy vlan_mon_nl_policy[VLAN_MON_ATTR_MAX + 1] = {
 	[VLAN_MON_ATTR_NONE]		    = { .type = NLA_UNSPEC,                     },
 	[VLAN_MON_ATTR_VLAN_MASK]	  = { .type = NLA_BINARY, .len = 4096/8       },
 	[VLAN_MON_ATTR_PROTO]       = { .type = NLA_U16,                        },
@@ -624,41 +630,53 @@ static struct nla_policy vlan_mon_nl_policy[VLAN_MON_ATTR_MAX + 1] = {
 	[VLAN_MON_ATTR_VID]         = { .type = NLA_U16,                        },
 };
 
-static struct genl_ops vlan_mon_nl_ops[] = {
+static const struct genl_ops vlan_mon_nl_ops[] = {
 	{
 		.cmd = VLAN_MON_CMD_NOOP,
 		.doit = vlan_mon_nl_cmd_noop,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 		.policy = vlan_mon_nl_policy,
+#endif
 		/* can be retrieved by unprivileged users */
 	},
 	{
 		.cmd = VLAN_MON_CMD_ADD,
 		.doit = vlan_mon_nl_cmd_add_vlan_mon,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 		.policy = vlan_mon_nl_policy,
+#endif
 		.flags = GENL_ADMIN_PERM,
 	},
 	{
 		.cmd = VLAN_MON_CMD_ADD_VID,
 		.doit = vlan_mon_nl_cmd_add_vlan_mon_vid,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 		.policy = vlan_mon_nl_policy,
+#endif
 		.flags = GENL_ADMIN_PERM,
 	},
 	{
 		.cmd = VLAN_MON_CMD_DEL,
 		.doit = vlan_mon_nl_cmd_del_vlan_mon,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 		.policy = vlan_mon_nl_policy,
+#endif
 		.flags = GENL_ADMIN_PERM,
 	},
 	{
 		.cmd = VLAN_MON_CMD_CHECK_BUSY,
 		.doit = vlan_mon_nl_cmd_check_busy,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 		.policy = vlan_mon_nl_policy,
+#endif
 		.flags = GENL_ADMIN_PERM,
 	},
 	{
 		.cmd = VLAN_MON_CMD_DEL_VID,
 		.doit = vlan_mon_nl_cmd_del_vlan_mon_vid,
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,2,0)
 		.policy = vlan_mon_nl_policy,
+#endif
 		.flags = GENL_ADMIN_PERM,
 	},
 };

@@ -18,6 +18,7 @@
 #define EV_SES_AUTH_FAILED  12
 #define EV_SES_PRE_FINISHED 13
 #define EV_SES_POST_STARTED 14
+#define EV_5G_PACKET        15
 #define EV_IP_CHANGED       100
 #define EV_SHAPER           101
 #define EV_MPPE_KEYS        102
@@ -27,8 +28,10 @@
 #define EV_RADIUS_ACCESS_ACCEPT 200
 #define EV_RADIUS_COA           201
 #define EV_SES_5G_STARTED       202
+#define EV_SES_5G_REGISTERED    203
 #define EV_5G_REGISTRATION      206
 #define EV_5G_DEREGISTRATION    204
+#define EV_5G_DHCP_PKT_RCVD     207
 
 struct ap_session;
 struct ppp_t;

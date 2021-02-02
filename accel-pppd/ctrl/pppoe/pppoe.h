@@ -146,7 +146,6 @@ int tr101_send_access_request(struct pppoe_tag *tr101, struct rad_packet_t *pack
 int tr101_send_accounting_request(struct pppoe_tag *tr101, struct rad_packet_t *pack);
 
 void pppoe_session_resume(struct ap_session_msg_t* msg);
-int __export pppoe_interface_find (char *ifname);
 
 #endif
 

@@ -30,6 +30,15 @@ struct _arphdr {
 	__be32 ar_tpa;
 } __packed;
 
+
+struct ap_session_ipoe_msg_t
+{
+	struct list_head entry;
+	uint32_t xid;
+	struct ipoe_session *ses;
+	char *session_id;
+};
+
 struct ipoe_serv {
 	struct list_head entry;
 	struct triton_context_t ctx;
@@ -44,6 +53,7 @@ struct ipoe_serv {
 	struct list_head disc_list;
 	struct list_head arp_list;
 	struct list_head req_list;
+        struct list_head ipoe_list;
 	struct triton_timer_t disc_timer;
 	struct triton_timer_t timer;
 	pthread_mutex_t lock;
@@ -159,6 +169,7 @@ void ipoe_nl_del_net(uint32_t addr);
 void *arpd_start(struct ipoe_serv *ipoe);
 void arpd_stop(void *arp);
 void arp_send(int ifindex, struct _arphdr *arph, int bc);
+void ipoe_session_resume(char *sessionid);
 
 #endif
 
