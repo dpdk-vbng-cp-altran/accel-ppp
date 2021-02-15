@@ -19,6 +19,7 @@
 #include "memdebug.h"
 extern int conf_noauth;
 int __export conf_ppp_5g_registration;
+in_addr_t  __export conf_5g_gw_ip_address;
 
 struct recv_opt_t
 {
@@ -918,6 +919,11 @@ static void load_config(void)
 	opt = conf_get_opt("ppp", "5g-registration-wanted");
 	if (opt)
 		conf_ppp_5g_registration = atoi(opt);
+
+	opt = conf_get_opt("ppp", "5g-gw-ip-address");
+	if (opt)
+		conf_5g_gw_ip_address = inet_addr(opt);
+
 
 }
 

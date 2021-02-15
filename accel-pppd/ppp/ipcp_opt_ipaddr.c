@@ -19,6 +19,7 @@
 struct list_head __export conn_list;
 static int conf_check_exists;
 extern int conf_ppp_5g_registration;
+extern in_addr_t conf_5g_gw_ip_address;
 
 static struct ipcp_option_t *ipaddr_init(struct ppp_ipcp_t *ipcp);
 static void ipaddr_free(struct ppp_ipcp_t *ipcp, struct ipcp_option_t *opt);
@@ -128,7 +129,7 @@ static int ipaddr_send_conf_req(struct ppp_ipcp_t *ipcp, struct ipcp_option_t *o
 				if (inet_pton (AF_INET, msg->ip_addr, buf_in_addr) == 1)
 				{
 					memcpy (&ip_addr, buf_in_addr, sizeof (struct in_addr));
-					memcpy (&ipcp->ppp->ses.ipv4->addr, buf_in_addr, sizeof (struct in_addr));
+					ipcp->ppp->ses.ipv4->addr = conf_5g_gw_ip_address;
 					memcpy (&ipcp->ppp->ses.ipv4->peer_addr, buf_in_addr, sizeof (struct in_addr));
 					ipcp->ppp->ses.ipv4->is_5g_ipaddr = true;
 				}
